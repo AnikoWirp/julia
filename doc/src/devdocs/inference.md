@@ -106,9 +106,9 @@ map(f, t::Tuple{Any}) in Base at tuple.jl:179
   1 │   %2  = Base.sitofp(Float64, %1)::Float64
   2 │   %3  = Base.lt_float(%2, 0.0)::Bool
   0 └──       goto #3 if not %3
-  0 2 ─       invoke Base.Math.throw_complex_domainerror(:sqrt::Symbol, %2::Float64)::Union{}
+  0 2 ─       invoke Math.throw_complex_domainerror(:sqrt::Symbol, %2::Float64)::Union{}
   0 └──       unreachable
- 20 3 ─ %7  = Base.Math.sqrt_llvm(%2)::Float64
+ 20 3 ─ %7  = Math.sqrt_llvm(%2)::Float64
   0 └──       goto #4
   0 4 ─       goto #5
   0 5 ─ %10 = Core.tuple(%7)::Tuple{Float64}
