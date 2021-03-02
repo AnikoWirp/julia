@@ -35,6 +35,7 @@ end
 mutable struct OptimizationState
     linfo::MethodInstance
     src::CodeInfo
+    ir::Any # Union{Nothing, IRCode}
     stmt_info::Vector{Any}
     mod::Module
     nargs::Int
@@ -50,7 +51,7 @@ mutable struct OptimizationState
                 get_inference_cache(interp),
                 WorldView(code_cache(interp), frame.world)))
         return new(frame.linfo,
-                   frame.src, frame.stmt_info, frame.mod, frame.nargs,
+                   frame.src, nothing, frame.stmt_info, frame.mod, frame.nargs,
                    frame.sptypes, frame.slottypes, false,
                    inlining)
     end
@@ -85,7 +86,7 @@ mutable struct OptimizationState
                 get_inference_cache(interp),
                 WorldView(code_cache(interp), get_world_counter())))
         return new(linfo,
-                   src, stmt_info, inmodule, nargs,
+                   src, nothing, stmt_info, inmodule, nargs,
                    sptypes_from_meth_instance(linfo), slottypes, false,
                    inlining)
         end
@@ -96,6 +97,18 @@ function OptimizationState(linfo::MethodInstance, params::OptimizationParams, in
     src === nothing && return nothing
     return OptimizationState(linfo, src, params, interp)
 end
+
+function ir_to_codeinf!(opt::OptimizationState)
+    replace_code_newstyle!(opt.src, opt.ir, opt.nargs - 1)
+    opt.ir = nothing
+    let src = opt.src::CodeInfo
+        widen_all_consts!(src)
+        src.inferred = true
+        return src
+    end
+end
+
+include("compiler/ssair/driver.jl")
 
 
 #############
@@ -149,7 +162,7 @@ function isinlineable(m::Method, me::OptimizationState, params::OptimizationPara
         end
     end
     if !inlineable
-        inlineable = inline_worthy(me.src.code, me.src, me.sptypes, me.slottypes, params, union_penalties, cost_threshold + bonus)
+        inlineable = inline_worthy(me.ir, params, union_penalties, cost_threshold + bonus)
     end
     return inlineable
 end
@@ -172,7 +185,7 @@ function stmt_affects_purity(@nospecialize(stmt), ir)
 end
 
 # Convert IRCode back to CodeInfo and compute inlining cost and sideeffects
-function finish(opt::OptimizationState, params::OptimizationParams, ir, @nospecialize(result))
+function finish(interp::AbstractInterpreter, opt::OptimizationState, params::OptimizationParams, ir, @nospecialize(result))
     def = opt.linfo.def
     nargs = Int(opt.nargs) - 1
 
@@ -222,7 +235,7 @@ function finish(opt::OptimizationState, params::OptimizationParams, ir, @nospeci
         end
     end
 
-    replace_code_newstyle!(opt.src, ir, nargs)
+    opt.ir = ir
 
     # determine and cache inlineability
     union_penalties = false
@@ -260,6 +273,7 @@ function finish(opt::OptimizationState, params::OptimizationParams, ir, @nospeci
             opt.src.inlineable = isinlineable(def, opt, params, union_penalties, bonus)
         end
     end
+
     nothing
 end
 
@@ -267,7 +281,7 @@ end
 function optimize(interp::AbstractInterpreter, opt::OptimizationState, params::OptimizationParams, @nospecialize(result))
     nargs = Int(opt.nargs) - 1
     @timeit "optimizer" ir = run_passes(opt.src, nargs, opt)
-    finish(opt, params, ir, result)
+    finish(interp, opt, params, ir, result)
 end
 
 
@@ -293,7 +307,7 @@ plus_saturate(x::Int, y::Int) = max(x, y, x+y)
 # known return type
 isknowntype(@nospecialize T) = (T === Union{}) || isa(T, Const) || isconcretetype(widenconst(T))
 
-function statement_cost(ex::Expr, line::Int, src::CodeInfo, sptypes::Vector{Any},
+function statement_cost(ex::Expr, line::Int, src, sptypes::Vector{Any},
                         slottypes::Vector{Any}, union_penalties::Bool,
                         params::OptimizationParams, error_path::Bool = false)
     head = ex.head
@@ -305,7 +319,7 @@ function statement_cost(ex::Expr, line::Int, src::CodeInfo, sptypes::Vector{Any}
         if ftyp === IntrinsicFunction && farg isa SSAValue
             # if this comes from code that was already inlined into another function,
             # Consts have been widened. try to recover in simple cases.
-            farg = src.code[farg.id]
+            farg = isa(src, CodeInfo) ? src.code[farg.id] : src.stmts[farg.id][:inst]
             if isa(farg, GlobalRef) || isa(farg, QuoteNode) || isa(farg, IntrinsicFunction) || isexpr(farg, :static_parameter)
                 ftyp = argextype(farg, src, sptypes, slottypes)
             end
@@ -347,7 +361,7 @@ function statement_cost(ex::Expr, line::Int, src::CodeInfo, sptypes::Vector{Any}
             end
             return T_FFUNC_COST[fidx]
         end
-        extyp = line == -1 ? Any : src.ssavaluetypes[line]
+        extyp = line == -1 ? Any : argextype(SSAValue(line), src, sptypes, slottypes)
         if extyp === Union{}
             return 0
         end
@@ -358,7 +372,7 @@ function statement_cost(ex::Expr, line::Int, src::CodeInfo, sptypes::Vector{Any}
         # run-time of the function, we omit them from
         # consideration. This way, non-inlined error branches do not
         # prevent inlining.
-        extyp = line == -1 ? Any : src.ssavaluetypes[line]
+        extyp = line == -1 ? Any : argextype(SSAValue(line), src, sptypes, slottypes)
         return extyp === Union{} ? 0 : 20
     elseif head === :(=)
         if ex.args[1] isa GlobalRef
@@ -383,7 +397,7 @@ function statement_cost(ex::Expr, line::Int, src::CodeInfo, sptypes::Vector{Any}
     return 0
 end
 
-function statement_or_branch_cost(@nospecialize(stmt), line::Int, src::CodeInfo, sptypes::Vector{Any},
+function statement_or_branch_cost(@nospecialize(stmt), line::Int, src::Union{CodeInfo, IRCode}, sptypes::Vector{Any},
                                   slottypes::Vector{Any}, union_penalties::Bool, params::OptimizationParams,
                                   throw_blocks::Union{Nothing,BitSet})
     thiscost = 0
@@ -401,13 +415,13 @@ function statement_or_branch_cost(@nospecialize(stmt), line::Int, src::CodeInfo,
     return thiscost
 end
 
-function inline_worthy(body::Array{Any,1}, src::CodeInfo, sptypes::Vector{Any}, slottypes::Vector{Any},
+function inline_worthy(ir::IRCode,
                        params::OptimizationParams, union_penalties::Bool=false, cost_threshold::Integer=params.inline_cost_threshold)
     bodycost::Int = 0
-    throw_blocks = params.unoptimize_throw_blocks ? find_throw_blocks(body) : nothing
-    for line = 1:length(body)
-        stmt = body[line]
-        thiscost = statement_or_branch_cost(stmt, line, src, sptypes, slottypes, union_penalties, params, throw_blocks)
+    throw_blocks = params.unoptimize_throw_blocks ? find_throw_blocks(ir.stmts.inst, RefValue(ir)) : nothing
+    for line = 1:length(ir.stmts)
+        stmt = ir.stmts[line][:inst]
+        thiscost = statement_or_branch_cost(stmt, line, ir, ir.sptypes, ir.argtypes, union_penalties, params, throw_blocks)
         bodycost = plus_saturate(bodycost, thiscost)
         bodycost > cost_threshold && return false
     end
@@ -487,5 +501,3 @@ function renumber_ir_elements!(body::Vector{Any}, ssachangemap::Vector{Int}, lab
         end
     end
 end
-
-include("compiler/ssair/driver.jl")

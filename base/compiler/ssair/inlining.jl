@@ -704,6 +704,7 @@ function resolve_todo(todo::InliningTodo, et::Union{EdgeTracker, Nothing}, cache
                     return compileable_specialization(et, spec.match)
                 end
                 isconst, src = true, quoted(inferred_src.val)
+            elseif isa(inferred_src, OptimizationState)
             end
         end
     else
